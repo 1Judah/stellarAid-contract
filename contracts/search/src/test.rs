@@ -269,3 +269,101 @@ fn reindexing_preserves_admin_set_rating() {
     // Re-indexing an existing artist must not double-count total_indexed.
     assert_eq!(client.get_indexed_count(), 1);
 }
+
+// ── #987: bounded scan and index consistency ──────────────────────────────
+
+#[test]
+fn set_rating_and_toggles_update_the_search_index() {
+    let env = Env::default();
+    let (client, _admin) = setup(&env);
+    let artist = Address::generate(&env);
+    client.index_artist(&artist, &Vec::new(&env), &50_i128, &Vec::new(&env));
+
+    // A rating set after indexing must be visible to the index-backed filter.
+    let mut filters = empty_filters(&env);
+    filters.min_rating = Some(80);
+    assert_eq!(
+        client.search(&filters, &SortBy::RatingDesc, &0, &10).total_matches,
+        0
+    );
+    client.set_rating(&artist, &90);
+    assert_eq!(
+        client.search(&filters, &SortBy::RatingDesc, &0, &10).total_matches,
+        1
+    );
+
+    // A deactivation must be visible to the index-backed filter too.
+    client.deactivate_listing(&artist, &artist);
+    assert_eq!(
+        client.search(&empty_filters(&env), &SortBy::Newest, &0, &10).total_matches,
+        0
+    );
+    client.reactivate_listing(&artist, &artist);
+    assert_eq!(
+        client.search(&empty_filters(&env), &SortBy::Newest, &0, &10).total_matches,
+        1
+    );
+}
+
+#[test]
+fn reindexing_rewrites_the_index_entry() {
+    let env = Env::default();
+    let (client, _admin) = setup(&env);
+    let artist = Address::generate(&env);
+    client.index_artist(
+        &artist,
+        &tags(&env, &["illustration"]),
+        &100_i128,
+        &Vec::new(&env),
+    );
+
+    // Re-index with a new price and skill; the old index entry must be replaced,
+    // not left stale.
+    client.index_artist(
+        &artist,
+        &tags(&env, &["logo-design"]),
+        &900_i128,
+        &Vec::new(&env),
+    );
+
+    let mut filters = empty_filters(&env);
+    filters.skill = Some(String::from_str(&env, "illustration"));
+    assert_eq!(
+        client.search(&filters, &SortBy::PriceAsc, &0, &10).total_matches,
+        0
+    );
+    let mut filters = empty_filters(&env);
+    filters.skill = Some(String::from_str(&env, "logo-design"));
+    let page = client.search(&filters, &SortBy::PriceAsc, &0, &10);
+    assert_eq!(page.total_matches, 1);
+    assert_eq!(page.results.get(0).unwrap().price, 900);
+    // The artist was not re-assigned a position.
+    assert_eq!(client.get_indexed_count(), 1);
+}
+
+#[test]
+fn full_scan_below_max_scan_is_not_truncated() {
+    let env = Env::default();
+    let (client, _admin) = setup(&env);
+    for _ in 0..5 {
+        let artist = Address::generate(&env);
+        client.index_artist(&artist, &Vec::new(&env), &10_i128, &Vec::new(&env));
+    }
+    let page = client.search(&empty_filters(&env), &SortBy::PriceAsc, &0, &10);
+    assert_eq!(page.total_matches, 5);
+    assert_eq!(page.scanned, 5);
+    assert!(!page.truncated);
+}
+
+#[test]
+fn scan_beyond_max_scan_is_reported_as_truncated() {
+    let env = Env::default();
+    let (client, _admin) = setup(&env);
+    for _ in 0..(MAX_SCAN + 5) {
+        let artist = Address::generate(&env);
+        client.index_artist(&artist, &Vec::new(&env), &10_i128, &Vec::new(&env));
+    }
+    let page = client.search(&empty_filters(&env), &SortBy::PriceAsc, &0, &10);
+    assert_eq!(page.scanned, MAX_SCAN, "scan cost is bounded by MAX_SCAN");
+    assert!(page.truncated, "partial results must be reported explicitly");
+}
