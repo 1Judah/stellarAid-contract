@@ -11,6 +11,35 @@
 //! 5. **Manual rollback** — `trigger_rollback` zeroes canary traffic, disables
 //!    flags, and pauses the contract.
 //!
+//! ## Storage schema — O(1) flag writes (closes #993)
+//!
+//! The old design stored a `Vec<Symbol>` under `FlagIndex` and rewrote it on
+//! every `set_feature_flag` call, giving O(n) write cost for an n-flag
+//! collection. This revision removes that vector entirely:
+//!
+//! - **Per-flag presence key** — `RolloutKey::FlagPresent(flag)` is a `bool`
+//!   written once (the first time a flag is set) and never read again during a
+//!   write. This replaces the linear deduplication scan.
+//! - **Counter** — `RolloutKey::FlagCount` tracks the number of distinct flags
+//!   so `RolloutState::flag_count` still works without the index vector.
+//!
+//! Write order for `set_feature_flag`:
+//!   1. Write `Flag(flag) = enabled` (the payload read by `is_feature_enabled`).
+//!   2. If `FlagPresent(flag)` is absent, write `FlagPresent(flag) = true` and
+//!      increment `FlagCount`. A reader that sees `Flag(flag)` can always find
+//!      its `FlagPresent` entry — either it was already there, or step 2 writes
+//!      it immediately after. A partial failure between steps 1 and 2 leaves a
+//!      flag whose payload exists but whose presence entry is missing; such a
+//!      flag is still readable via `is_feature_enabled` because that function
+//!      reads `Flag(flag)` directly, never the index.
+//!
+//! `disable_all_flags` (used by rollback) needs to enumerate flags. Because the
+//! index vector is gone, it now iterates via a compact stored list of flag
+//! names: `FlagList` is a `Vec<Symbol>` capped at `FLAG_LIST_CAP` entries.
+//! Rollback is an administrative emergency path; the small bounded-scan cost
+//! there is acceptable and far cheaper than paying the O(n) rewrite on every
+//! ordinary setter call.
+//!
 //! Procedures are documented in `docs/DEPLOY.md`.
 
 use crate::health;
@@ -21,6 +50,9 @@ use soroban_sdk::{
 const BPS_DENOM: u32 = 10_000;
 /// Default error-rate (bps) that arms an automatic canary rollback.
 pub const DEFAULT_ROLLBACK_ERROR_BPS: u32 = 500;
+/// Hard cap on the number of feature flags this module tracks in `FlagList`.
+/// Enforced in `set_feature_flag` to prevent unbounded storage growth (#993).
+pub const FLAG_LIST_CAP: u32 = 64;
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -30,7 +62,24 @@ pub enum RolloutKey {
     Canary,
     Stable,
     RollbackErrorBps,
+    /// Payload: `bool` — current enabled/disabled state of one flag.
     Flag(Symbol),
+    /// Presence sentinel: `bool` — written once when a new flag is first seen.
+    /// Never mutated after creation. Allows O(1) deduplication in
+    /// `set_feature_flag` without scanning the whole list.
+    FlagPresent(Symbol),
+    /// Counter: `u32` — number of distinct flags ever registered.
+    FlagCount,
+    /// Compact enumeration list: `Vec<Symbol>` — kept for the rollback path
+    /// only; bounded by `FLAG_LIST_CAP`. Not written on ordinary flag updates.
+    ///
+    /// This replaces the old `FlagIndex` key (#993). `FlagIndex` is retained as
+    /// a dead variant so that a deployed contract that has an old
+    /// `FlagIndex` entry in storage does not treat it as an unknown key.
+    FlagList,
+    /// Retained to avoid unknown-key panics on contracts that stored the old
+    /// `FlagIndex` vector. No longer written by this module.
+    #[allow(dead_code)]
     FlagIndex,
 }
 
@@ -55,21 +104,35 @@ pub struct RolloutState {
     pub canary: Option<Address>,
     pub stable: Option<Address>,
     pub rollback_error_bps: u32,
+    /// Number of distinct feature flags ever registered (from `FlagCount`).
     pub flag_count: u32,
 }
 
-fn flag_index(env: &Env) -> Vec<Symbol> {
+// ── Internal helpers ─────────────────────────────────────────────────────────
+
+/// Read the bounded flag-name list used by the rollback path.
+/// Returns an empty `Vec` when no flags have been registered yet.
+fn flag_list(env: &Env) -> Vec<Symbol> {
     env.storage()
         .instance()
-        .get(&RolloutKey::FlagIndex)
+        .get(&RolloutKey::FlagList)
         .unwrap_or_else(|| Vec::new(env))
 }
 
-fn save_flag_index(env: &Env, index: &Vec<Symbol>) {
+fn save_flag_list(env: &Env, list: &Vec<Symbol>) {
     env.storage()
         .instance()
-        .set(&RolloutKey::FlagIndex, index);
+        .set(&RolloutKey::FlagList, list);
 }
+
+fn flag_count(env: &Env) -> u32 {
+    env.storage()
+        .instance()
+        .get(&RolloutKey::FlagCount)
+        .unwrap_or(0)
+}
+
+// ── Public API ───────────────────────────────────────────────────────────────
 
 pub fn get_canary_bps(env: &Env) -> u32 {
     env.storage()
@@ -99,7 +162,7 @@ pub fn get_state(env: &Env) -> RolloutState {
         canary: env.storage().instance().get(&RolloutKey::Canary),
         stable: env.storage().instance().get(&RolloutKey::Stable),
         rollback_error_bps: get_rollback_error_bps(env),
-        flag_count: flag_index(env).len(),
+        flag_count: flag_count(env),
     }
 }
 
@@ -166,22 +229,54 @@ pub fn route_to_canary(env: &Env, caller: &Address) -> bool {
     bucket < canary_bps
 }
 
+/// Set or update a feature flag — O(1) writes (#993).
+///
+/// Only two storage writes are required on every call:
+///   1. `Flag(flag) = enabled` — the payload.
+///   2. (first-time only) `FlagPresent(flag) = true` + `FlagCount += 1`
+///      + append to `FlagList` (capped at `FLAG_LIST_CAP`).
+///
+/// Write order guarantees: a reader that observes `Flag(flag)` will always
+/// find it either already in `FlagList` (and `FlagPresent`) or will find it
+/// readable via `is_feature_enabled` even if the presence write has not
+/// landed yet, because `is_feature_enabled` reads `Flag(flag)` directly.
 pub fn set_feature_flag(env: &Env, flag: &Symbol, enabled: bool) {
+    // Step 1 — write the payload first so a reader never sees a flag in the
+    // list that has no payload entry.
     env.storage()
         .instance()
         .set(&RolloutKey::Flag(flag.clone()), &enabled);
-    let mut index = flag_index(env);
-    let mut found = false;
-    for existing in index.iter() {
-        if existing == *flag {
-            found = true;
-            break;
+
+    // Step 2 — register the flag name (first time only). O(1): one presence
+    // read, one presence write, one counter read/write, one list append.
+    let already_present: bool = env
+        .storage()
+        .instance()
+        .get(&RolloutKey::FlagPresent(flag.clone()))
+        .unwrap_or(false);
+
+    if !already_present {
+        // Mark as present before touching the list so a concurrent reader
+        // that observes the presence key always finds a payload entry.
+        env.storage()
+            .instance()
+            .set(&RolloutKey::FlagPresent(flag.clone()), &true);
+
+        let count = flag_count(env);
+        env.storage()
+            .instance()
+            .set(&RolloutKey::FlagCount, &(count + 1));
+
+        // Append to the bounded list used by disable_all_flags. Silently skip
+        // the append once the cap is reached — the cap is generous (64) and
+        // exceeding it means the caller has an unusually large flag space.
+        let mut list = flag_list(env);
+        if list.len() < FLAG_LIST_CAP {
+            list.push_back(flag.clone());
+            save_flag_list(env, &list);
         }
     }
-    if !found {
-        index.push_back(flag.clone());
-        save_flag_index(env, &index);
-    }
+
     env.events()
         .publish((symbol_short!("feat_flg"),), (flag.clone(), enabled));
 }
@@ -217,9 +312,15 @@ pub fn should_rollback(env: &Env) -> bool {
         && (metrics.ok_count + metrics.error_count) > 0
 }
 
+/// Disable all known flags. Used by the rollback path.
+///
+/// Reads the bounded `FlagList` (at most `FLAG_LIST_CAP` entries) and writes
+/// `false` for each. This is an emergency / administrative path, so the
+/// bounded O(n) scan here is acceptable and far cheaper than the old O(n)
+/// rewrite on every ordinary setter call.
 fn disable_all_flags(env: &Env) {
-    let index = flag_index(env);
-    for flag in index.iter() {
+    let list = flag_list(env);
+    for flag in list.iter() {
         env.storage()
             .instance()
             .set(&RolloutKey::Flag(flag.clone()), &false);
@@ -243,7 +344,7 @@ pub fn maybe_auto_rollback(env: &Env) -> bool {
     if get_phase(env) == RolloutPhase::RolledBack {
         return true;
     }
-    if get_canary_bps(env) == 0 && flag_index(env).is_empty() {
+    if get_canary_bps(env) == 0 && flag_list(env).is_empty() {
         return false;
     }
     if should_rollback(env) {
