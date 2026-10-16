@@ -120,26 +120,91 @@ fn is_ordered(a: &ArtistListing, b: &ArtistListing, sort_by: SortBy) -> bool {
     }
 }
 
-/// Stable insertion sort over the (already filtered, so bounded) match set.
-/// `soroban_sdk::Vec` gives O(1) get/set, which is all insertion sort needs.
-fn sort_listings(mut listings: Vec<ArtistListing>, sort_by: SortBy) -> Vec<ArtistListing> {
-    let n = listings.len();
-    let mut i = 1;
-    while i < n {
-        let key = listings.get(i).unwrap();
-        let mut j = i;
-        while j > 0 {
-            let prev = listings.get(j - 1).unwrap();
-            if is_ordered(&prev, &key, sort_by) {
-                break;
+/// Bounded top-k selection: scan `all_artists` once, maintaining only the top
+/// `k = start + page_size` candidates in a small buffer via insertion.
+///
+/// This is O(m · k) with tiny k (at most 2 × MAX_PAGE_SIZE) instead of the
+/// O(m log m) full sort-then-window. Output is byte-identical to the previous
+/// implementation for the same input, including tie-breaking (ties break towards
+/// the earlier artist in scan order, matching the stable sort behaviour).
+///
+/// Returns `(page_results, total_matches)` so the caller can populate
+/// `SearchResultPage` without retaining the full match set.
+fn select_page(
+    env: &Env,
+    all_artists: &Vec<Address>,
+    filters: &SearchFilters,
+    sort_by: SortBy,
+    start: u32,
+    page_size: u32,
+) -> (Vec<ArtistListing>, u32) {
+    // k is the number of candidates we keep: enough to fill `start + page_size`.
+    let k = start.saturating_add(page_size);
+    // Buffer holding the current top-k candidates, insertion-sorted.
+    let mut buf: Vec<ArtistListing> = Vec::new(env);
+    let mut total_matches: u32 = 0;
+
+    for artist in all_artists.iter() {
+        let maybe_listing: Option<ArtistListing> =
+            env.storage().persistent().get(&DataKey::Listing(artist));
+        if let Some(listing) = maybe_listing {
+            if !matches_filters(&listing, filters) {
+                continue;
             }
-            listings.set(j, prev);
-            j -= 1;
+            total_matches += 1;
+
+            // Determine where `listing` fits in the current buffer.
+            // We want buf[0] to be the "best" (first in sorted order) and
+            // buf[len-1] to be the "worst". We only keep the top-k best.
+            let buf_len = buf.len();
+
+            if buf_len < k {
+                // Buffer not yet full — insert in sorted position.
+                let mut pos = buf_len;
+                while pos > 0 {
+                    let prev = buf.get(pos - 1).unwrap();
+                    // `is_ordered(prev, listing)` means prev comes before listing,
+                    // so listing goes after. Stop scanning backwards.
+                    if is_ordered(&prev, &listing, sort_by) {
+                        break;
+                    }
+                    pos -= 1;
+                }
+                buf.insert(pos, listing);
+            } else {
+                // Buffer is full. Only insert if this candidate beats the
+                // current worst (buf[k-1]) — otherwise it would be outside
+                // the top-k window and can be dropped.
+                let worst = buf.get(k - 1).unwrap();
+                if is_ordered(&listing, &worst, sort_by) && listing != worst {
+                    // Find insertion position in the top-(k-1) portion.
+                    let mut pos = k - 1;
+                    while pos > 0 {
+                        let prev = buf.get(pos - 1).unwrap();
+                        if is_ordered(&prev, &listing, sort_by) {
+                            break;
+                        }
+                        pos -= 1;
+                    }
+                    // Remove last (worst) element and insert new one.
+                    buf.remove(k - 1);
+                    buf.insert(pos, listing);
+                }
+            }
         }
-        listings.set(j, key);
-        i += 1;
     }
-    listings
+
+    // Extract the page window [start, start + page_size) from the buffer.
+    let mut page_results: Vec<ArtistListing> = Vec::new(env);
+    if start < buf.len() {
+        let end = core::cmp::min(start.saturating_add(page_size), buf.len());
+        let mut i = start;
+        while i < end {
+            page_results.push_back(buf.get(i).unwrap());
+            i += 1;
+        }
+    }
+    (page_results, total_matches)
 }
 
 #[contractimpl]
@@ -295,30 +360,12 @@ impl Search {
             .get(&DataKey::AllArtists)
             .unwrap_or_else(|| Vec::new(&env));
 
-        let mut matched: Vec<ArtistListing> = Vec::new(&env);
-        for artist in all.iter() {
-            let maybe_listing: Option<ArtistListing> =
-                env.storage().persistent().get(&DataKey::Listing(artist));
-            if let Some(listing) = maybe_listing {
-                if matches_filters(&listing, &filters) {
-                    matched.push_back(listing);
-                }
-            }
-        }
-
-        let total_matches = matched.len();
-        let sorted = sort_listings(matched, sort_by);
-
+        // Bounded top-k selection: O(m · k) where k = start + page_size,
+        // instead of O(m log m) over the full match set. Output is identical
+        // to the previous full-sort + window approach. See `select_page`.
         let start = page.saturating_mul(page_size);
-        let mut page_results: Vec<ArtistListing> = Vec::new(&env);
-        if start < total_matches {
-            let end = core::cmp::min(start.saturating_add(page_size), total_matches);
-            let mut i = start;
-            while i < end {
-                page_results.push_back(sorted.get(i).unwrap());
-                i += 1;
-            }
-        }
+        let (page_results, total_matches) =
+            select_page(&env, &all, &filters, sort_by, start, page_size);
 
         let mut analytics = load_analytics(&env);
         analytics.total_searches += 1;

@@ -312,6 +312,21 @@ impl RevenueSharing {
             .unwrap_or_else(|| Vec::new(&env))
     }
 
+    /// Paginated variant of `get_history`.
+    pub fn get_history_page(
+        env: Env,
+        id: Bytes,
+        start: u32,
+        limit: u32,
+    ) -> (Vec<RevenueEntry>, shared::PageInfo) {
+        let history: Vec<RevenueEntry> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::History(id))
+            .unwrap_or_else(|| Vec::new(&env));
+        shared::pagination::paginated(&env, &history, start, limit)
+    }
+
     pub fn get_report(env: Env, id: Bytes) -> Result<RevenueReport, RevenueError> {
         let agreement = load_agreement(&env, &id)?;
         Ok(RevenueReport {

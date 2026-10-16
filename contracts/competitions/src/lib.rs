@@ -494,6 +494,22 @@ impl Competitions {
             .unwrap_or_else(|| Vec::new(&env))
     }
 
+    /// Paginated variant of `get_history`. Returns at most `clamp_limit(limit)`
+    /// items starting at `start`, plus [`shared::PageInfo`] so callers can
+    /// page to the end without a separate count call.
+    pub fn get_history_page(
+        env: Env,
+        start: u32,
+        limit: u32,
+    ) -> (Vec<CompetitionSummary>, shared::PageInfo) {
+        let history: Vec<CompetitionSummary> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::History)
+            .unwrap_or_else(|| Vec::new(&env));
+        shared::pagination::paginated(&env, &history, start, limit)
+    }
+
     // ── Health monitoring (#678) and gradual rollout (#684) ──────────────
     pub fn health_check(env: Env) -> shared::health::HealthReport {
         let report = shared::health::health_check(&env);
