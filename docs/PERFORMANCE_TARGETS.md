@@ -336,7 +336,19 @@ a `harness = false` target on stable, a deterministic event budget enforced by d
 `cargo test` via `src/test.rs`, and wall-clock budgets gated behind an environment variable
 because they are not portable across CI hardware.
 
-Two limitations to keep in mind when copying it:
+**Status as of #994 (closes #994):**
+Deterministic event-budget enforcement has been extended from `verification` to the other three
+benchmarked contracts that compile: `competitions`, `subscription`, and `reputation`. Each now
+has a `tests/event_budgets.rs` integration test (mirroring `verification/tests/event_budgets.rs`)
+registered as a `[[test]]` target in its `Cargo.toml`. The budgets run under `cargo test` —
+and therefore under the `test` CI job — without requiring `cargo bench` at all.
+
+Additionally, a dedicated `bench` CI job and a `make bench` Makefile target have been added
+(closes #996) so benchmark results are reported in every PR summary. The CI job uses
+`continue-on-error: true` while known compile errors persist; the deterministic event-count
+gates in the `test` job do not share this bypass.
+
+Two limitations to keep in mind when copying the pattern:
 
 - It runs against the in-memory test `Env` with a native contract, so its `median_ns` is not an
   instruction count. `env.cost_estimate()` gives real instruction and I/O numbers, but it is
@@ -348,7 +360,7 @@ Two limitations to keep in mind when copying it:
   on the second call.
 
 `env.cost_estimate().resources()` on `soroban-sdk` ≥ 22 is the concrete next step for turning
-§2's fractions into enforced numbers.
+§2's fractions into enforced numbers. See §6 below for the upgrade plan.
 
 ## 6. Honest status
 
@@ -385,6 +397,19 @@ Two limitations to keep in mind when copying it:
   cannot run until the crate compiles.
 - **The `soroban-sdk` ceilings in §1 are from 25.1.1.** The repository pins 21.0.0, an earlier
   protocol. Re-derive before relying on the headroom.
+- **`soroban-sdk` 22 upgrade plan (closes #995).** `env.cost_estimate()` is unavailable in
+  sdk 21 and is the blocker for real instruction counts. The upgrade is a major-version bump
+  across all 28 dependent crates and must be sequenced *after* the workspace compiles cleanly
+  (existing parse errors and compile failures must be resolved first). Steps:
+  1. Resolve all pre-existing compile errors (the BASELINE block in `ci.yml` lists them).
+  2. Land the sdk 22 bump as a single PR with a migration note; do not upgrade incrementally.
+  3. Coordinate with the `stellar-strkey 0.0.2 → 0.0.8` and `stellar-xdr` bumps (same PR or
+     sequenced immediately after), since both are already breaking the workspace.
+  4. Once the workspace compiles on sdk 22, replace event-count budgets in each
+     `tests/event_budgets.rs` with `env.cost_estimate().resources()` instruction counts.
+  5. Update §2 and §3 budgets from derived fractions to observed numbers.
+  6. Remove this note and the sdk caveat in §5 once instruction counts are enforced.
+  7. Update the `CI BASELINE` comment in `.github/workflows/ci.yml`.
 
 ## 7. Updating this document
 

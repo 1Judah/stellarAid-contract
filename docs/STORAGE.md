@@ -2,6 +2,19 @@
 
 Per-contract storage layout and TTL policy for every crate in the workspace.
 
+> **Schema change — storage-schema bump to 2 (closes #993).**
+> `shared::rollout` no longer stores a `Vec<Symbol>` under `RolloutKey::FlagIndex`.
+> It has been replaced by three O(1) entries per flag:
+> - `RolloutKey::Flag(flag)` — `bool` payload (unchanged).
+> - `RolloutKey::FlagPresent(flag)` — `bool` sentinel, written once on first use.
+> - `RolloutKey::FlagCount` — `u32` count of distinct flags ever registered.
+> - `RolloutKey::FlagList` — `Vec<Symbol>` bounded at 64 entries, used only by
+>   the rollback path (`disable_all_flags`).
+> `RolloutKey::FlagIndex` is **retired** (kept as a dead variant to avoid
+> unknown-key panics on deployed contracts that still carry the old entry).
+> Any table entry below that references `FlagIndex` documents the *old* schema.
+> The new keys are described in `contracts/shared/src/rollout.rs`.
+
 > - **Retention and pruning policy:** [RETENTION_AND_PRUNING.md](./RETENTION_AND_PRUNING.md)
 >   — what may be pruned, what must never be, the retention windows, and the
 >   bounded prune entry point that exists today. Read this before adding any

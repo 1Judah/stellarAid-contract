@@ -424,6 +424,21 @@ impl Verification {
             .unwrap_or_else(|| Vec::new(&env))
     }
 
+    /// Paginated variant of `get_history`.
+    pub fn get_history_page(
+        env: Env,
+        artist: Address,
+        start: u32,
+        limit: u32,
+    ) -> (Vec<VerificationRecord>, shared::PageInfo) {
+        let history: Vec<VerificationRecord> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::History(artist))
+            .unwrap_or_else(|| Vec::new(&env));
+        shared::pagination::paginated(&env, &history, start, limit)
+    }
+
     /// Badge eligibility: approved and not past its refresh deadline.
     pub fn is_verified(env: Env, artist: Address) -> bool {
         match load_portfolio(&env, &artist) {
@@ -571,11 +586,41 @@ impl Verification {
             .unwrap_or_else(|| Vec::new(&env))
     }
 
+    /// Paginated variant of `get_artist_badge_types`.
+    pub fn get_artist_badge_types_page(
+        env: Env,
+        artist: Address,
+        start: u32,
+        limit: u32,
+    ) -> (Vec<BadgeType>, shared::PageInfo) {
+        let types: Vec<BadgeType> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::BadgeTypes(artist))
+            .unwrap_or_else(|| Vec::new(&env));
+        shared::pagination::paginated(&env, &types, start, limit)
+    }
+
     pub fn get_badge_history(env: Env, artist: Address) -> Vec<BadgeEvent> {
         env.storage()
             .persistent()
             .get(&DataKey::BadgeHistory(artist))
             .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// Paginated variant of `get_badge_history`.
+    pub fn get_badge_history_page(
+        env: Env,
+        artist: Address,
+        start: u32,
+        limit: u32,
+    ) -> (Vec<BadgeEvent>, shared::PageInfo) {
+        let history: Vec<BadgeEvent> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::BadgeHistory(artist))
+            .unwrap_or_else(|| Vec::new(&env));
+        shared::pagination::paginated(&env, &history, start, limit)
     }
 
     pub fn set_min_score(env: Env, min_score: u32) -> Result<(), VerificationError> {

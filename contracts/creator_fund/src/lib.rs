@@ -430,6 +430,36 @@ impl CreatorFund {
             .unwrap_or_else(|| Vec::new(&env))
     }
 
+    /// Paginated variant of `get_allocations`.
+    pub fn get_allocations_page(
+        env: Env,
+        fund_id: Bytes,
+        start: u32,
+        limit: u32,
+    ) -> (Vec<Allocation>, shared::PageInfo) {
+        let allocations: Vec<Allocation> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Allocations(fund_id))
+            .unwrap_or_else(|| Vec::new(&env));
+        shared::pagination::paginated(&env, &allocations, start, limit)
+    }
+
+    /// Paginated variant of `get_growth`.
+    pub fn get_growth_page(
+        env: Env,
+        fund_id: Bytes,
+        start: u32,
+        limit: u32,
+    ) -> (Vec<GrowthPoint>, shared::PageInfo) {
+        let growth: Vec<GrowthPoint> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Growth(fund_id))
+            .unwrap_or_else(|| Vec::new(&env));
+        shared::pagination::paginated(&env, &growth, start, limit)
+    }
+
     // ── Health monitoring (#678) and gradual rollout (#684) ──────────────
     pub fn health_check(env: Env) -> shared::health::HealthReport {
         let report = shared::health::health_check(&env);
