@@ -483,6 +483,8 @@ impl CreatorFund {
         limit: u32,
     ) -> (Vec<GrowthPoint>, shared::pagination::PageInfo) {
         let all: Vec<GrowthPoint> = env
+    ) -> (Vec<GrowthPoint>, shared::PageInfo) {
+        let growth: Vec<GrowthPoint> = env
             .storage()
             .persistent()
             .get(&DataKey::Growth(fund_id))
@@ -538,6 +540,7 @@ impl CreatorFund {
     /// The proposed successor awaiting acceptance, if any.
     pub fn get_pending_admin(env: Env) -> Option<Address> {
         shared::admin::pending_admin(&env)
+        shared::pagination::paginated(&env, &growth, start, limit)
     }
 
     // ── Health monitoring (#678) and gradual rollout (#684) ──────────────
