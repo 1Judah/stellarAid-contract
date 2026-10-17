@@ -8,45 +8,61 @@ How versions are stored, queried, and constrained is defined in [docs/VERSIONING
 
 ## [Unreleased]
 
-### Fixed
-
-- **#790** `platform_config::ConfigError`: `AddressNotRegistered` and `InvalidTier` both had
-  discriminant `6`. Renumbered to unique values 6–10 (`AddressNotRegistered=6`, `InvalidTier=7`,
-  `InvalidPromotion=8`, `InvalidReferralBps=9`, `PromotionNotActive=10`). Callers who matched on
-  numeric error codes must update for `InvalidTier` (7 → was 6) and `InvalidPromotion` (8 → was 7),
-  `InvalidReferralBps` (9 → was 8), and `PromotionNotActive` (10 → was 9).
-
-- **#992** `search::search`: Replaced O(m log m) full-match-set sort with a bounded top-k selection
-  (`select_page`). Cost is now O(m · k) where k = `start + page_size` (at most 2 × `MAX_PAGE_SIZE`).
-  Output is identical to the previous implementation for the same input, including tie-breaking.
-
-- **Workflows** `security.yml`: `rustsec/audit-check@v2` and `EmbarkStudios/cargo-deny-action@v2`
-  were being used as install steps but each ran a full audit/check internally, then the explicit
-  `run:` step ran the same command again. Replaced both with `taiki-e/install-action@v2` (install
-  only) so each tool runs exactly once via the explicit step. Fixed concurrency group key to include
-  `github.workflow` (matching the pattern in `ci.yml`/`typescript-ci.yml`).
-
 ### Added
 
-- **#990** Paginated list-getter variants for seven contracts that returned unbounded `Vec`s. Each
-  new `*_page(start, limit)` function routes through `shared::pagination::paginated` and returns
-  `(Vec<T>, shared::PageInfo)`:
-  - `competitions::get_history_page`
-  - `creator_fund::get_allocations_page`, `get_growth_page`
-  - `revenue_sharing::get_history_page`
-  - `subscription::get_payments_page`
-  - `verification::get_history_page`, `get_artist_badge_types_page`, `get_badge_history_page`
-  - `messaging::get_messages` now uses `shared::pagination::clamp_limit` instead of a manual
-    `.min(MAX_HISTORY)`.
-  Existing signatures are unchanged; callers relying on unbounded results should migrate to the
-  `*_page` variants.
+- **`donation` — bounded retention for donation lists (#986).** Both
+  `DataKey::DonationHistory(donor)` and `DataKey::CampaignDonations(campaign_id)`
+  are now ring-trimmed on every write to an admin-configurable cap
+  (`DEFAULT_DONATION_HISTORY = 100`, code ceiling `MAX_DONATION_HISTORY = 500`),
+  so a popular campaign can no longer grow an unbounded vector that every later
+  read has to pay for. New entry points: `get_donation_retention_cap`,
+  `get_donation_retention_policy`, `set_donation_retention_cap`, and the bounded
+  `prune_campaign_donations`.
+- **`withdrawal` — bounded per-campaign index (#986).** `WithdrawalsByCampaign`
+  now stores `Vec<u64>` ids instead of full records — the canonical
+  `Withdrawal(id)` is stored once, so records are no longer duplicated — and is
+  ring-trimmed to an admin-configurable cap
+  (`DEFAULT_WITHDRAWALS_PER_CAMPAIGN = 100`, ceiling
+  `MAX_WITHDRAWALS_PER_CAMPAIGN = 500`). New: `get_withdrawal_retention_cap`,
+  `get_withdrawal_retention_policy`, `set_withdrawal_retention_cap`, and
+  `prune_withdrawals_by_campaign`.
+- **`search` — bounded, indexed scan (#987).** Listings are denormalised into
+  `DataKey::Index(u32)` entries (`ArtistIndexEntry`) with an `IndexCount` and a
+  reverse `ArtistIndex(Address)` map. `search` now scans at most
+  `MAX_SCAN = 200` index entries and reads only the returned page's `Listing`
+  records; `SearchResultPage` gained `scanned` and `truncated` so a partial
+  result is explicit rather than silently incomplete.
+- **`escrow` — `AtomicCommit` TTL and bounded lifetime (#988).** The atomic
+  commit marker is now TTL-extended on every access
+  (`storage::ATOMIC_COMMIT_TTL_LEDGERS = 432_000`), and an `InProgress` marker
+  older than `cross_contract::ATOMIC_COMMIT_MAX_LIFETIME_LEDGERS = 120_960` is
+  resolved to the terminal `RolledBack` state, so a commit can no longer be
+  stranded in limbo or expire mid-flight. `get_atomic_commit` routes through the
+  refreshing reader.
+- **`revenue_sharing` — `record_revenue` benchmark (#989).** A new
+  `harness = false` bench (`benches/revenue_sharing_benchmark.rs`) measures
+  `record_revenue` at 2/5/20 participants and the insufficient-balance abort
+  path, with deterministic event budgets and opt-in wall-clock gating. The event
+  budgets are also asserted by `event_budget_scales_with_participants` in
+  `src/test.rs`, so plain `cargo test` catches an event-volume change.
 
-### Notes
+### Changed
 
-- **#991** `platform_config::compute_fees` caching: this issue is currently blocked because
-  `platform_config` does not compile (pre-existing `lib.rs` parse errors noted in the `ci.yml`
-  BASELINE block). No changes were made. The issue can be addressed once the workspace compile
-  blockers are resolved.
+- **`donation`, `withdrawal` and `search` storage schema bumped 1 → 2**
+  (`[package.metadata.stellar-aid] storage-schema`).
+- **`withdrawal::get_withdrawals_by_campaign` and the two `donation` history
+  getters now return `(Vec<..>, PageInfo)` and take `start`/`limit`**, replacing
+  the previous whole-list reads (#986).
+- **`search`: `DataKey::AllArtists` is removed** and replaced by the
+  `Index`/`IndexCount`/`ArtistIndex` layout. Existing listings are not migrated
+  into the new index; `index_artist` must be called again to make an artist
+  discoverable (#987).
+
+### Fixed
+
+- **`escrow::DataKey::AtomicCommit` can no longer expire mid-flow (#988).** The
+  marker was previously written with no `extend_ttl` and no removal path, so a
+  commit left `InProgress` could be archived before it was finalised.
 
 ## [0.1.0] — 2026-08-27
 

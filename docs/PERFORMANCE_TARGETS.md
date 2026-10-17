@@ -128,9 +128,6 @@ constant ceiling on the configured value at `initialize` time.
 
 | Contract | List | Push | Notes |
 |---|---|---|---|
-| `donation` | `DonationHistory` (`lib.rs:17`) | `:113` | Uncapped, one per donation per donor. |
-| `donation` | `CampaignDonations` (`lib.rs:18`) | `:108` | Uncapped, and **global per campaign**, so it is shared by every donor. |
-| `withdrawal` | `WithdrawalsByCampaign` (`lib.rs:16`) | `:94` | Uncapped; each record is also stored separately at `Withdrawal(id)`, so it is stored twice. |
 | `ecosystem_funding` | `Milestones` (`lib.rs:110`) | `:196` | Written from a caller-supplied `Vec` through an uncapped loop (`:167-170`). |
 | `mentorship` | `Milestones` (`lib.rs:97`) | `:180` | Same, via a caller-supplied `Vec` (`:179-188`). |
 | `licensing` | `Usage` (`lib.rs:114`) | `:356-361` | Append-only usage log. |
@@ -138,8 +135,16 @@ constant ceiling on the configured value at `initialize` time.
 | `reputation` (1st contract) | `Report` dedup scan | `:138-145` | `for i in 0..count` over reports-so-far, O(n) per report. **UNVERIFIED.** |
 | `verification` | `BadgeTypes` (`lib.rs:132-134`) | `:133` | No trim, but bounded in practice by the `BadgeType` enum's variant count. |
 | `dao` | `MultiSigSigners` (`lib.rs:113`) | — | Caller-supplied `Vec<Address>`, no length check at write. |
-| `search` | `AllArtists` (`types.rs:76`, **instance**) | `lib.rs:210` | One entry per distinct artist, no removal path. |
 | `platform_config` | `FeeTiers` (`storage.rs:27`, **instance**) | — | No cap; `upsert_fee_tier` scans and rebuilds the whole list (`:177-199`). **UNVERIFIED.** |
+
+**Since fixed by #986:** `donation::DonationHistory` / `CampaignDonations` and
+`withdrawal::WithdrawalsByCampaign` were all in this table. They are now
+ring-trimmed on write to a code-capped, admin-configurable retention cap
+(`MAX_DONATION_HISTORY` / `MAX_WITHDRAWALS_PER_CAMPAIGN` = 500, default 100) and
+have bounded explicit prune entry points; the withdrawal index also no longer
+duplicates the canonical record. **Since fixed by #987:** `search::AllArtists`
+was replaced by a bounded `Index` / `IndexCount` / `ArtistIndex` layout — see
+§2.5.
 
 ### 2.3 `RolloutKey::FlagIndex` — one uncapped loop reachable from every contract
 
@@ -175,7 +180,7 @@ more than a couple of dozen entries is a design smell anyway. Until that lands, 
 |---|---|---|
 | `audit::write_entry` | up to **10 persistent** + 10 `extend_ttl` | `audit/src/storage.rs:90-123` |
 | `revenue_sharing::record_revenue` | up to **23** | 1 + N `Earnings` (N ≤ 20) + `Agreement` + `History`, `lib.rs:209-290` |
-| `search::search` | 1 write, but **N reads** | `search/src/lib.rs:299-307` |
+| `search::search` | 1 write, but up to `MAX_SCAN` (200) reads, bounded (#987) | `search/src/lib.rs` |
 | `donation::donate` | 3 | `lib.rs:109`, `:114`, `:118` |
 | `creator_fund::execute_allocation` | 4 | `lib.rs` `:384` and surrounds |
 | `recruitment::apply_for_job` | 4 | `lib.rs:241`, `:250`, `:253` |
@@ -193,10 +198,13 @@ is not covered by any benchmark.
   20, so ~400 comparisons — acceptable, but it is why the 20 cap must not be raised casually.
 - `multi_sig::validate_config` (`lib.rs:107-113`) is O(n²) dedup. Bounded by
   `MAX_SIGNERS = 10` (`types.rs:7`) — fine.
-- `search::sort_listings` (`lib.rs:125-143`) is O(n²) over the full match set, and
-  `search::search` (`:273-333`) does one `persistent().get` per artist (`:299-307`) over the
-  whole uncapped `AllArtists` list before sorting. This is the single most expensive read path
-  in the repository: unbounded reads **and** quadratic CPU in one invocation.
+- `search::sort_entries` (formerly `sort_listings`) is O(n²) over the match set,
+  but as of #987 `search::search` scans at most `MAX_SCAN` (200) `Index(u32)`
+  entries and reads only the returned page's `Listing` records. That turns the
+  repository's previously most expensive read path — unbounded reads **and**
+  quadratic CPU in one invocation — into a bounded one (≤ 200 index reads plus
+  the page's listing reads). The 200-entry cap is what keeps the O(n²) sort
+  acceptable; do not raise it casually.
 
 ### 2.6 Token transfers and cross-contract calls
 
@@ -215,9 +223,13 @@ Per invocation, and none of these are in a loop except where noted:
 
 The two looped-transfer paths are the ones with a real ceiling risk. `record_revenue`'s 20 is
 indirectly bounded by `MAX_PARTICIPANTS`; `distribute_batch`'s 25 is a checked code constant
-(`commission_agreement/src/lib.rs:1184`). Both are defensible. They should be **benchmarked**,
-which neither currently is — they are the most expensive operations in the repository by
-instruction count and neither has a benchmark.
+(`commission_agreement/src/lib.rs:1184`). Both are defensible. As of #989
+`record_revenue` **is** benchmarked
+(`contracts/revenue_sharing/benches/revenue_sharing_benchmark.rs`: 2/5/20 recipients plus the
+insufficient-balance abort path), and its measured event volume and cost-per-recipient are in
+[`BENCHMARK_RESULTS.md`](./BENCHMARK_RESULTS.md) §5. `distribute_batch` remains unmeasured
+because `commission_agreement` does not compile (§6) — the highest single-call transfer loop in
+the repository still has no measurement.
 
 `dispute_arbiter::partial_resolve` at five cross-contract invokes in one call is the outlier on
 the invoke side, and none of the five are in a loop.
@@ -231,7 +243,8 @@ in the same pass as anything here.
 **Do extend:** `analytics` (`ANALYTICS_TTL_LEDGERS = 1_296_000`, `lib.rs:26`, applied `:126`,
 `:132`, `:521`), `audit` (`AUDIT_TTL_LEDGERS = 5_184_000`, `storage.rs:28`), `multi_sig`
 (`MULTISIG_TTL_LEDGERS = 1_296_000`, `lib.rs:79`, applied `:142-145`, `:284-288`),
-`rate_limiter` (`lib.rs:239-243`), `escrow` for `DataKey::Escrow` only (`lib.rs:68-72`),
+`rate_limiter` (`lib.rs:239-243`), `escrow` for `DataKey::Escrow` and, as of #988,
+`DataKey::AtomicCommit` (`ATOMIC_COMMIT_TTL_LEDGERS = 432_000`),
 `campaign` partially, `platform_config` for `DataKey::Volume` (`storage.rs:243-245`).
 
 **Do not extend:** `creator_fund`, `dao`, `dispute_arbiter`, `donation`, `ecosystem_funding`,
@@ -239,11 +252,13 @@ in the same pass as anything here.
 `search`, `subscription`, `verification`, `withdrawal`, and every key of
 `commission_agreement`.
 
-Two specific gaps worth calling out:
+Specific gaps worth calling out:
 
-- `escrow::DataKey::AtomicCommit` is written at `cross_contract.rs:69` with no `extend_ttl`
-  and no removal path, so an atomic commit can expire mid-flight. `DataKey::Escrow` right next
-  to it *is* extended.
+- ~~`escrow::DataKey::AtomicCommit` is written at `cross_contract.rs:69` with no `extend_ttl`
+  and no removal path, so an atomic commit can expire mid-flight.~~ **Resolved in #988:**
+  the marker is now TTL-extended on every read and write, and an `InProgress` marker older
+  than `ATOMIC_COMMIT_MAX_LIFETIME_LEDGERS` (120,960) resolves to the terminal `RolledBack`
+  state instead of being stranded.
 - `campaign` extends on `create_campaign` (`:276`), `update_raised` (`:337`) and
   `finalize_withdrawal` (`:364`) but not on `update_campaign_status` (`:310-312`) or
   `reject_campaign` (`:392-394`), so a campaign that is only ever rejected loses its record
@@ -288,16 +303,28 @@ Ordered by (likelihood of being hit) × (blast radius), not by effort.
 2. **Cap `RolloutKey::FlagIndex` in `shared/src/rollout.rs`** (§2.3). One change fixes every
    contract that carries the rollout block, and it currently makes a read-shaped entry point
    capable of an unbounded write loop.
-3. **Trim the uncapped lists in §2.2**, starting with `donation::CampaignDonations` (global per
-   campaign, shared by all donors) and `withdrawal::WithdrawalsByCampaign` (which also stores
-   every record twice).
-4. **Add code-constant ceilings to the admin-configured caps** in §2.2, and bound
-   `search::search` — the only path in the repository with both unbounded reads and quadratic CPU.
-5. **Add `extend_ttl` to the keys in §2.7**, `escrow::AtomicCommit` first, since that one is a
-   correctness bug rather than a tuning question.
-6. **Benchmark `revenue_sharing::record_revenue` and `commission_agreement::distribute_batch`**
-   (§2.6). These are the two looped-transfer operations and are more expensive than anything
-   currently benchmarked.
+3. ~~**Trim the uncapped lists in §2.2**, starting with `donation::CampaignDonations`
+   (global per campaign, shared by all donors) and `withdrawal::WithdrawalsByCampaign`
+   (which also stores every record twice).~~ **Done in #986:** both are ring-trimmed on
+   write to a code-capped, admin-configurable retention cap, with bounded explicit
+   prunes; the withdrawal index now stores ids, so the double storage is gone.
+4. ~~**Add code-constant ceilings to the admin-configured caps** in §2.2, and bound
+   `search::search` — the only path in the repository with both unbounded reads and
+   quadratic CPU.~~ **Partly done:** `search::search` is bounded by `MAX_SCAN` (#987),
+   and the `donation`/`withdrawal` caps carry code ceilings (#986). The remaining
+   admin-configured caps in §2.2 (`verification`, `subscription`, `creator_fund`,
+   `revenue_sharing`, `competitions`, `recruitment` `HistoryLimit` / `MaxApplicants`)
+   still accept unbounded values.
+5. ~~**Add `extend_ttl` to the keys in §2.7**, `escrow::AtomicCommit` first, since that
+   one is a correctness bug rather than a tuning question.~~ **Done for
+   `escrow::AtomicCommit` (#988).** The other §2.7 keys are unchanged; `AtomicCommit`
+   was the correctness bug and is fixed.
+6. ~~**Benchmark `revenue_sharing::record_revenue` and
+   `commission_agreement::distribute_batch`** (§2.6).~~ **Half done in #989:**
+   `record_revenue` now has a `harness = false` bench (2/5/20 recipients plus the
+   insufficient-balance abort path) with results in
+   [`BENCHMARK_RESULTS.md`](./BENCHMARK_RESULTS.md) §5. `distribute_batch` remains
+   blocked on `commission_agreement` compiling.
 7. Add `shared::pagination` variants for the four contracts in §2.1 that have none.
 
 ## 5. Regression detection
@@ -343,10 +370,12 @@ Two limitations to keep in mind when copying the pattern:
   still true for §2 and §3, but **it no longer holds for the whole repository**: as of
   #870–#872 three contracts (`competitions`, `subscription`, `reputation`) build and have
   running benches, with results in [`BENCHMARK_RESULTS.md`](./BENCHMARK_RESULTS.md).
-- **The workspace does not currently build.** Twelve files under `contracts/` have unclosed
+- **The workspace does not currently build.** Files under `contracts/` have unclosed
   delimiters on `upstream/main`, including `contracts/reputation/src/lib.rs`,
-  `contracts/platform_config/src/*`, `contracts/escrow/src/lib.rs` and
-  `contracts/commission_agreement/src/lib.rs`. See [`DEPLOYMENT.md`](./DEPLOYMENT.md) §8. This
+  `contracts/platform_config/src/*` and `contracts/commission_agreement/src/lib.rs`.
+  (`contracts/escrow/src/lib.rs` was on this list in an earlier revision, but the
+  splice it described is not present in the current source — see
+  [`STORAGE.md`](./STORAGE.md) §escrow.) See [`DEPLOYMENT.md`](./DEPLOYMENT.md) §8. This
   is pre-existing and unrelated to #875. Two files matter for §2: `reputation/src/lib.rs` has
   two separate contracts concatenated into one file (`ReputationContract` ends mid-body at
   `:644`, a second contract starts at `:344`), and `commission_agreement/src/lib.rs` has
@@ -364,7 +393,7 @@ Two limitations to keep in mind when copying the pattern:
   buildable, and has errors beyond the delimiter: `DataKey::RateLimiter` and
   `types::RateLimitKey` are referenced but do not exist in its `types.rs`, duplicate error
   discriminants 10–13 in `errors.rs`, duplicate imports, use-after-moves, and an oversized
-  `#[contracterror]` symbol. Its bench (`BENCHMARK_RESULTS.md` §5) is therefore written but
+  `#[contracterror]` symbol. Its bench (`BENCHMARK_RESULTS.md` §6) is therefore written but
   cannot run until the crate compiles.
 - **The `soroban-sdk` ceilings in §1 are from 25.1.1.** The repository pins 21.0.0, an earlier
   protocol. Re-derive before relying on the headroom.
