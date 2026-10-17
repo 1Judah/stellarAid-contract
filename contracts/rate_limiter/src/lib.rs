@@ -23,6 +23,7 @@
 //! window cannot keep its position warm.
 
 #![no_std]
+#![allow(dead_code)]
 
 use soroban_sdk::{contract, contractimpl, symbol_short, Address, Env, Map, Symbol};
 
@@ -91,7 +92,7 @@ fn load_config(env: &Env, key: &RateLimitKey) -> Option<RateLimitConfig> {
         .instance()
         .get(&types::DataKey::RateLimitConfig)
         .unwrap_or_else(|| Map::new(env));
-    configs.get(key.clone())
+    configs.get(*key)
 }
 
 /// Every configured key, in declaration order. `reset_limits` walks this list.
@@ -142,7 +143,7 @@ impl RateLimiter {
             .unwrap_or_else(|| Map::<RateLimitKey, RateLimitConfig>::new(&env));
 
         configs.set(
-            key.clone(),
+            key,
             RateLimitConfig {
                 limit,
                 window_ledgers,
@@ -191,14 +192,14 @@ impl RateLimiter {
             None => return Err(RateLimitError::NotInitialized),
         };
 
-        let record_key = RateLimitRecord::key(key.clone(), account.clone());
+        let record_key = RateLimitRecord::key(key, account.clone());
         let current_ledger = env.ledger().sequence();
 
         // Get existing record or create a new one
         let mut record: RateLimitRecord = env.storage().persistent()
             .get(&record_key)
             .unwrap_or_else(|| RateLimitRecord {
-                key: key.clone(),
+                key,
                 account: account.clone(),
                 count: 0,
                 first_ledger: current_ledger,
@@ -276,7 +277,7 @@ impl RateLimiter {
 
     /// Get the current count for a rate limit key and account
     pub fn get_count(env: Env, key: RateLimitKey, account: Address) -> Option<u32> {
-        let record_key = RateLimitRecord::key(key.clone(), account.clone());
+        let record_key = RateLimitRecord::key(key, account.clone());
         let record: Option<RateLimitRecord> = env.storage().persistent().get(&record_key);
 
         match record {
@@ -291,13 +292,13 @@ impl RateLimiter {
 
         // Remove all records for this account
         for key in all_keys().iter() {
-            let record_key = RateLimitRecord::key(key.clone(), account.clone());
+            let record_key = RateLimitRecord::key(*key, account.clone());
             env.storage().persistent().remove(&record_key);
         }
 
         env.events().publish(
             (symbol_short!("rl_reset"),),
-            (account),
+            account,
         );
 
         Ok(())
@@ -305,7 +306,7 @@ impl RateLimiter {
 
     /// Get the current rate limit status for an account
     pub fn get_status(env: Env, key: RateLimitKey, account: Address) -> Option<RateLimitRecord> {
-        let record_key = RateLimitRecord::key(key.clone(), account.clone());
+        let record_key = RateLimitRecord::key(key, account.clone());
         env.storage().persistent().get(&record_key)
     }
 

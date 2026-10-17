@@ -211,7 +211,7 @@ impl MultiSigContract {
     ) -> Result<Proposal, MultiSigError> {
         creator.require_auth();
         let config = load_config(&env)?;
-        if action.len() == 0 {
+        if action.is_empty() {
             return Err(MultiSigError::InvalidAction);
         }
         if env
@@ -272,6 +272,9 @@ impl MultiSigContract {
             return Err(MultiSigError::ProposalClosed);
         }
         let now = env.ledger().sequence();
+        if now > proposal.expires_ledger {
+            return Err(MultiSigError::ProposalClosed);
+        }
         if now >= proposal.expires_ledger {
             return Err(MultiSigError::ProposalExpired);
         }
@@ -315,7 +318,11 @@ impl MultiSigContract {
         if proposal.status != ProposalStatus::Pending {
             return Err(MultiSigError::ProposalClosed);
         }
-        if env.ledger().sequence() >= proposal.expires_ledger {
+        let now = env.ledger().sequence();
+        if now > proposal.expires_ledger {
+            return Err(MultiSigError::ProposalClosed);
+        }
+        if now >= proposal.expires_ledger {
             proposal.status = ProposalStatus::Expired;
             save_proposal(&env, &proposal);
             env.events()
@@ -370,7 +377,13 @@ impl MultiSigContract {
     }
 
     pub fn get_proposal(env: Env, proposal_id: Bytes) -> Result<Proposal, MultiSigError> {
-        load_proposal(&env, &proposal_id)
+        let mut proposal = load_proposal(&env, &proposal_id)?;
+        if proposal.status == ProposalStatus::Pending
+            && env.ledger().sequence() >= proposal.expires_ledger
+        {
+            proposal.status = ProposalStatus::Expired;
+        }
+        Ok(proposal)
     }
 
     /// `true` only for a proposal that reached the threshold and was finalized.

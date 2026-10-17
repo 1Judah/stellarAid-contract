@@ -42,7 +42,12 @@ impl Fixture<'_> {
     }
 
     fn check(&self, key: &RateLimitKey, who: &Address) -> Result<(), RateLimitError> {
-        self.client.check_rate_limit(key, who)
+        match self.client.try_check_rate_limit(key, who) {
+            Ok(Ok(())) => Ok(()),
+            Err(Ok(err)) => Err(err),
+            Err(Err(e)) => panic!("invoke error: {:?}", e),
+            Ok(Err(e)) => panic!("conversion error: {:?}", e),
+        }
     }
 
     fn advance(&self, ledgers: u32) {

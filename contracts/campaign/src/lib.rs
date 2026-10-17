@@ -50,7 +50,7 @@ pub enum DataKey {
     /// Whether the open dispute resolved as allowed (`true`) or blocked (`false`) (#758).
     DisputeOutcome(u64),
     /// Ledger at which a withdrawal may be finalized.
-    WithdrawalDelayLedgers(u32),
+    WithdrawalDelayLedgers,
     /// Total already refunded to a `(campaign, donor)` pair.
     Refunded(u64, Address),
     /// `true` once `actor` has donated to `campaign_id`. Drives the
@@ -81,6 +81,8 @@ pub struct ContractUpgradedEvent {
     pub admin: Address,
     pub new_wasm_hash: BytesN<32>,
     pub ledger: u32,
+}
+
 /// A withdrawal that has been requested but not yet finalized.
 ///
 /// `available_at` is the ledger at which the funds may be drawn; it is
@@ -164,6 +166,7 @@ const MIN_DONATION_AMOUNT: i128 = 1;
 const DEFAULT_WITHDRAWAL_DELAY_LEDGERS: u32 = 17_280;
 
 /// Denominator for basis-point math.
+#[allow(dead_code)]
 const BPS_DENOM: i128 = 10_000;
 
 #[contract]
@@ -636,8 +639,8 @@ impl CampaignContract {
             WithdrawalRequestedEvent {
                 campaign_id,
                 amount,
-                requested_at,
-                available_at,
+                requested_at: requested_at as u64,
+                available_at: available_at as u64,
             },
         );
 
@@ -676,7 +679,7 @@ impl CampaignContract {
             WithdrawalCancelledEvent {
                 campaign_id,
                 amount: pending.amount,
-                cancelled_at: env.ledger().sequence(),
+                cancelled_at: env.ledger().sequence() as u64,
             },
         );
     }
@@ -726,13 +729,6 @@ impl CampaignContract {
         // half-applied debit (#759 / #764).
         crate::require!(env, contract_balance, campaign.raised, amount);
 
-        // Checked subtraction: an underflow here would mean paying out funds
-        // the campaign never raised (#760).
-        campaign.raised = math::sub(&env, campaign.raised, amount);
-        if amount > campaign.raised {
-            panic!("insufficient funds: requested exceeds raised amount");
-        }
-
         if let Some(pending) = Self::get_pending_withdrawal(env.clone(), campaign_id) {
             if env.ledger().sequence() < pending.available_at {
                 panic!("WithdrawalWindowNotElapsed: withdrawal is still pending");
@@ -745,12 +741,9 @@ impl CampaignContract {
                 .remove(&DataKey::PendingWithdrawal(campaign_id));
         }
 
-        campaign.raised = campaign
-            .raised
-            .checked_sub(amount)
-            .expect("raised total underflow");
+        campaign.raised = math::sub(&env, campaign.raised, amount);
 
-        let already_withdrawn = Self::get_total_withdrawn(&env, campaign_id);
+        let already_withdrawn = Self::get_total_withdrawn(env.clone(), campaign_id);
         let total_withdrawn = already_withdrawn
             .checked_add(amount)
             .expect("withdrawn total overflow");
@@ -768,16 +761,6 @@ impl CampaignContract {
         let (fee, _net) = math::fee_split(&env, amount, campaign.fee_bps);
 
         guard::release(&env);
-        env.events().publish(
-            (Symbol::new(&env, "withdrawal_finalized"),),
-            (campaign_id, amount, fee, campaign.owner, env.ledger().timestamp()),
-        // `recipient` is the creator: they are the only party authorized to
-        // finalize, and funds may only ever be drawn to the campaign owner.
-        // `fee` is the platform's entitlement on the drawn amount.
-        let fee = amount
-            .checked_mul(campaign.fee_bps as i128)
-            .expect("platform fee arithmetic overflow")
-            / BPS_DENOM;
 
         // `withdrawal_finalized` is a separate event from
         // `withdrawal_requested` (#757) and is emitted only after the debits
@@ -1131,7 +1114,7 @@ impl CampaignContract {
         );
         env.storage()
             .persistent()
-            .set(&DataKey::DisputeEvidenceCount(campaign_id), &count + 1);
+            .set(&DataKey::DisputeEvidenceCount(campaign_id), &(count + 1));
         Self::bump_campaign_ttl(env.clone(), campaign_id);
     }
 
@@ -1278,7 +1261,7 @@ impl CampaignContract {
             .expect("contract not initialized");
         admin.require_auth();
 
-        env.deployer().update_current_contract_wasm(new_wasm_hash);
+        env.deployer().update_current_contract_wasm(new_wasm_hash.clone());
 
         env.events().publish(
             (Symbol::new(&env, "contract_upgraded"),),
@@ -1395,17 +1378,6 @@ impl CampaignContract {
             .unwrap_or(false)
     }
 
-    /// Whether `actor` has been recorded as a donor of `campaign_id`.
-    ///
-    /// Backs the "donor or creator" authorization rule for the dispute entry
-    /// points (#763). The donation contract records the marker after a settled
-    /// token transfer, so it is only ever set for a real donation.
-    fn has_donated(env: &Env, campaign_id: u64, actor: &Address) -> bool {
-        env.storage()
-            .persistent()
-            .get(&DataKey::CampaignDonor(campaign_id, actor.clone()))
-            .unwrap_or(false)
-    }
 
     fn next_campaign_id(env: &Env) -> u64 {
         let current: u64 = env
@@ -1533,6 +1505,7 @@ mod auth_tests;
 mod invariant_tests;
 #[cfg(test)]
 mod negative_tests;
+#[cfg(test)]
 mod event_tests;
 #[cfg(test)]
 mod test {
