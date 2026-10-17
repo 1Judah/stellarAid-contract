@@ -1,5 +1,7 @@
 # Storage and TTL Management in stellarAid Contracts
 
+> **Summary.** This hand-maintained reference documents the storage layout, storage classes (`instance`, `persistent`, `temporary`), ledger constants, and TTL extension policies for 23 contracts and the `shared` library. It does not cover omitted workspace crates (`campaign_factory`, `campaign_instance`, `factory`) or automate state pruning. Unlike the single integer `storage-schema` version defined in each crate's `[package.metadata.stellar-aid]` manifest for semver upgrade checks, this document details the concrete `DataKey` enums and storage functions transcribed directly from source code. Following the honest framing of `PERFORMANCE_TARGETS.md` §6, the documented keys and constants are verified code facts, but dynamic storage costs and TTL survival guarantees remain aspirational because unbuilt contracts have not executed on chain. It is written for contract developers and auditors managing persistence budgets and expiration risks, who should start with [How to read this](#how-to-read-this) and [Summary across the workspace](#summary-across-the-workspace).
+
 Per-contract storage layout and TTL policy for every crate in the workspace.
 
 > **Schema change — storage-schema bump to 2 (closes #993).**
