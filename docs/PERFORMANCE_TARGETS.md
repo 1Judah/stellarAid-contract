@@ -300,31 +300,32 @@ Ordered by (likelihood of being hit) × (blast radius), not by effort.
 1. **Clamp caller-supplied `limit` in the six getters in §2.1**, and switch the `offset + limit`
    bounds to `saturating_add`. This is the only item on the list that is a remotely-triggerable
    resource-exhaustion path, and the `nft` one also has an unchecked-addition bug.
+   **DONE (#984).** `competitions`, `creator_fund`, `messaging`, `rate_limiter`,
+   `revenue_sharing`, `subscription` and `verification` now route every caller-supplied
+   `limit` through `shared::pagination::clamp_limit`; each gains a `*_page` getter that
+   uses `collect_window` and returns `PageInfo`, so a truncated page is distinguishable
+   from a complete one. The `initialize` paths that take a `history_limit` now clamp it to
+   `MAX_LIMIT`, closing the "configured cap with no ceiling" half of §2.2 as well. No public
+   signature changed.
 2. **Cap `RolloutKey::FlagIndex` in `shared/src/rollout.rs`** (§2.3). One change fixes every
    contract that carries the rollout block, and it currently makes a read-shaped entry point
    capable of an unbounded write loop.
-3. ~~**Trim the uncapped lists in §2.2**, starting with `donation::CampaignDonations`
-   (global per campaign, shared by all donors) and `withdrawal::WithdrawalsByCampaign`
-   (which also stores every record twice).~~ **Done in #986:** both are ring-trimmed on
-   write to a code-capped, admin-configurable retention cap, with bounded explicit
-   prunes; the withdrawal index now stores ids, so the double storage is gone.
-4. ~~**Add code-constant ceilings to the admin-configured caps** in §2.2, and bound
-   `search::search` — the only path in the repository with both unbounded reads and
-   quadratic CPU.~~ **Partly done:** `search::search` is bounded by `MAX_SCAN` (#987),
-   and the `donation`/`withdrawal` caps carry code ceilings (#986). The remaining
-   admin-configured caps in §2.2 (`verification`, `subscription`, `creator_fund`,
-   `revenue_sharing`, `competitions`, `recruitment` `HistoryLimit` / `MaxApplicants`)
-   still accept unbounded values.
-5. ~~**Add `extend_ttl` to the keys in §2.7**, `escrow::AtomicCommit` first, since that
-   one is a correctness bug rather than a tuning question.~~ **Done for
-   `escrow::AtomicCommit` (#988).** The other §2.7 keys are unchanged; `AtomicCommit`
-   was the correctness bug and is fixed.
-6. ~~**Benchmark `revenue_sharing::record_revenue` and
-   `commission_agreement::distribute_batch`** (§2.6).~~ **Half done in #989:**
-   `record_revenue` now has a `harness = false` bench (2/5/20 recipients plus the
-   insufficient-balance abort path) with results in
-   [`BENCHMARK_RESULTS.md`](./BENCHMARK_RESULTS.md) §5. `distribute_batch` remains
-   blocked on `commission_agreement` compiling.
+   **DONE (#985).** `save_flag_index` refuses to grow the index past the effective cap and
+   aborts the invocation with `RolloutError::FlagLimitReached`, reverting the whole write so
+   the cap is atomic. The ceiling is the code constant `MAX_FEATURE_FLAGS = 32`; an admin may
+   lower the effective cap to it (`set_flag_cap`), never raise it, and the current value is
+   reported by `rollout::flag_cap` and in `RolloutState::flag_cap`. Enforcement is in the one
+   shared function, so a new contract cannot reintroduce the problem.
+3. **Trim the uncapped lists in §2.2**, starting with `donation::CampaignDonations` (global per
+   campaign, shared by all donors) and `withdrawal::WithdrawalsByCampaign` (which also stores
+   every record twice).
+4. **Add code-constant ceilings to the admin-configured caps** in §2.2, and bound
+   `search::search` — the only path in the repository with both unbounded reads and quadratic CPU.
+5. **Add `extend_ttl` to the keys in §2.7**, `escrow::AtomicCommit` first, since that one is a
+   correctness bug rather than a tuning question.
+6. **Benchmark `revenue_sharing::record_revenue` and `commission_agreement::distribute_batch`**
+   (§2.6). These are the two looped-transfer operations and are more expensive than anything
+   currently benchmarked.
 7. Add `shared::pagination` variants for the four contracts in §2.1 that have none.
 
 ## 5. Regression detection

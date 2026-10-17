@@ -169,6 +169,19 @@ const BPS_DENOM: i128 = 10_000;
 #[contract]
 pub struct CampaignContract;
 
+/// Collapse the shared handover error onto this crate's `Error` (#983).
+///
+/// `Error` occupies the campaign band (`300–399`) and cannot grow a variant
+/// outside `errors.rs`, so a missing contract is `NotInitialized` and every
+/// other refusal — wrong caller, no pending transfer, or proposing the current
+/// admin — is `Unauthorized`.
+fn map_admin_error(err: shared::admin::AdminError) -> Error {
+    match err {
+        shared::admin::AdminError::NotInitialized => Error::NotInitialized,
+        _ => Error::Unauthorized,
+    }
+}
+
 #[contractimpl]
 impl CampaignContract {
     /// Initialize the campaign contract with an admin address.
@@ -1248,15 +1261,80 @@ impl CampaignContract {
         );
     }
 
-    /// Transfer admin privileges to a new address.
+    // ── Admin key rotation (closes #983) ─────────────────────────────────
+    //
+    // Two-step handover, the state machine defined once in `shared::admin`.
+    // The active admin stays under `DataKey::Admin`; only the pending successor
+    // lives in the shared key space. `set_admin` above remains the immediate,
+    // dual-signed path for an operator that already holds both keys; this is
+    // the recoverable path for a key that is being rotated out.
+
+    /// Step 1 — `current_admin` proposes `new_admin` as its successor.
+    ///
+    /// The active admin is unchanged until `new_admin` calls [`accept_admin`],
+    /// so a mistyped or compromised proposal is recoverable: `current_admin`
+    /// can call [`cancel_admin_transfer`] at any point before acceptance.
+    /// `shared::admin::propose` requests the proposer's auth itself, so it is
+    /// not requested here — only the stored-admin check is this contract's job.
     pub fn transfer_admin(env: Env, current_admin: Address, new_admin: Address) {
         guard::acquire(&env);
         Self::require_not_frozen(&env);
         pause::require_not_paused(&env);
-        current_admin.require_auth();
         Self::ensure_admin(&env, &current_admin);
+        match shared::admin::propose(&env, &current_admin, &new_admin) {
+            Ok(()) => {}
+            Err(err) => errors::raise(&env, map_admin_error(err)),
+        }
+        guard::release(&env);
+    }
+
+    /// Step 2 — the proposed successor accepts and becomes the active admin.
+    ///
+    /// Only `new_admin`'s own signature can complete the handover.
+    pub fn accept_admin(env: Env, new_admin: Address) {
+        guard::acquire(&env);
+        Self::require_not_frozen(&env);
+        pause::require_not_paused(&env);
+        let previous_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .unwrap_or_else(|| errors::raise(&env, Error::NotInitialized));
+        match shared::admin::accept(&env, &previous_admin, &new_admin) {
+            Ok(()) => {}
+            Err(err) => errors::raise(&env, map_admin_error(err)),
+        }
         env.storage().instance().set(&DataKey::Admin, &new_admin);
         guard::release(&env);
+
+        // Campaign tooling already watches `admin_changed` for the immediate
+        // `set_admin` path; publish the same shape here so an indexer sees one
+        // rotation event regardless of which path performed it.
+        env.events().publish(
+            (Symbol::new(&env, "admin_changed"),),
+            AdminChangedEvent {
+                old_admin: previous_admin,
+                new_admin,
+            },
+        );
+    }
+
+    /// Withdraw an in-flight proposal; the active admin is left in place.
+    pub fn cancel_admin_transfer(env: Env, admin: Address) {
+        guard::acquire(&env);
+        Self::require_not_frozen(&env);
+        pause::require_not_paused(&env);
+        Self::ensure_admin(&env, &admin);
+        match shared::admin::cancel(&env, &admin) {
+            Ok(()) => {}
+            Err(err) => errors::raise(&env, map_admin_error(err)),
+        }
+        guard::release(&env);
+    }
+
+    /// The proposed successor awaiting acceptance, if any.
+    pub fn get_pending_admin(env: Env) -> Option<Address> {
+        shared::admin::pending_admin(&env)
     }
 
     /// Upgrade the contract to a new WASM implementation.
@@ -1482,6 +1560,26 @@ impl CampaignContract {
     }
     pub fn is_feature_enabled(env: Env, flag: soroban_sdk::Symbol) -> bool {
         shared::rollout::is_feature_enabled(&env, &flag)
+    }
+    /// Lower this contract's feature-flag cap within the shared ceiling (#985).
+    ///
+    /// `shared::rollout::MAX_FEATURE_FLAGS` is the hard ceiling; this only ever
+    /// lowers the effective cap, so future tuning needs no new code. The current
+    /// value is returned by [`get_flag_cap`] and in
+    /// `get_rollout_state().flag_cap`.
+    pub fn set_flag_cap(
+        env: Env,
+        admin: Address,
+        cap: u32,
+    ) -> Result<(), shared::rollout::RolloutError> {
+        Self::require_not_frozen(&env);
+        admin.require_auth();
+        Self::ensure_admin(&env, &admin);
+        shared::rollout::set_flag_cap(&env, cap)
+    }
+    /// The effective feature-flag cap for this contract (#985).
+    pub fn get_flag_cap(env: Env) -> u32 {
+        shared::rollout::flag_cap(&env)
     }
     pub fn set_canary_deployment(
         env: Env,
@@ -2249,5 +2347,145 @@ mod test {
             client.finalize_withdrawal(&campaign_id, &1_000_i128);
         }));
         assert!(res_wd.is_err());
+    }
+
+    // ── Two-step admin handover (#983) ───────────────────────────────────
+
+    #[test]
+    fn transfer_admin_is_two_step_and_accept_rotates() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, CampaignContract);
+        let client = CampaignContractClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let successor = Address::generate(&env);
+
+        client.initialize(&admin);
+
+        // Step 1 only proposes: the active admin must not move yet.
+        client.transfer_admin(&admin, &successor);
+        assert_eq!(client.get_admin(), admin);
+        assert_eq!(client.get_pending_admin(), Some(successor.clone()));
+
+        // Step 2, signed by the successor, completes the rotation.
+        client.accept_admin(&successor);
+        assert_eq!(client.get_admin(), successor);
+        assert_eq!(client.get_pending_admin(), None);
+    }
+
+    #[test]
+    fn unaccepted_transfer_does_not_change_admin() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, CampaignContract);
+        let client = CampaignContractClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let successor = Address::generate(&env);
+
+        client.initialize(&admin);
+        client.transfer_admin(&admin, &successor);
+
+        // No accept: the original admin still controls the contract.
+        assert_eq!(client.get_admin(), admin);
+    }
+
+    #[test]
+    fn cancelled_transfer_leaves_original_admin_in_place() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, CampaignContract);
+        let client = CampaignContractClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let successor = Address::generate(&env);
+
+        client.initialize(&admin);
+        client.transfer_admin(&admin, &successor);
+        client.cancel_admin_transfer(&admin);
+
+        assert_eq!(client.get_admin(), admin);
+        assert_eq!(client.get_pending_admin(), None);
+
+        // Cancelling with nothing in flight is a typed failure.
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.cancel_admin_transfer(&admin);
+        }));
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn transfer_admin_to_self_is_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, CampaignContract);
+        let client = CampaignContractClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+
+        client.initialize(&admin);
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.transfer_admin(&admin, &admin);
+        }));
+        assert!(res.is_err());
+        assert_eq!(client.get_pending_admin(), None);
+    }
+
+    #[test]
+    fn accept_by_a_non_successor_is_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, CampaignContract);
+        let client = CampaignContractClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let successor = Address::generate(&env);
+        let impostor = Address::generate(&env);
+
+        client.initialize(&admin);
+        client.transfer_admin(&admin, &successor);
+
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.accept_admin(&impostor);
+        }));
+        assert!(res.is_err());
+        // The impostor did not consume the proposal.
+        assert_eq!(client.get_admin(), admin);
+        assert_eq!(client.get_pending_admin(), Some(successor));
+    }
+
+    #[test]
+    fn double_accept_is_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, CampaignContract);
+        let client = CampaignContractClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let successor = Address::generate(&env);
+
+        client.initialize(&admin);
+        client.transfer_admin(&admin, &successor);
+        client.accept_admin(&successor);
+
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.accept_admin(&successor);
+        }));
+        assert!(res.is_err());
+        assert_eq!(client.get_admin(), successor);
+    }
+
+    #[test]
+    fn transfer_admin_is_blocked_while_frozen() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, CampaignContract);
+        let client = CampaignContractClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let successor = Address::generate(&env);
+
+        client.initialize(&admin);
+        client.freeze();
+
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.transfer_admin(&admin, &successor);
+        }));
+        assert!(res.is_err());
+        assert_eq!(client.get_pending_admin(), None);
     }
 }

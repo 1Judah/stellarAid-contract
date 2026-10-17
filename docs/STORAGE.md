@@ -96,6 +96,35 @@ that is correct and intentional. For one that does store persistent data, it
 means the data sits at the network's minimum TTL and will expire unless
 something else restores it — those cases are called out inline.
 
+## Storage-schema changes: #983 and #985
+
+Two issues in this change add keys rather than re-interpret existing ones, so
+existing deployments keep every stored value's meaning:
+
+- **#983 (admin rotation).** `shared::admin` adds one shared key,
+  `AdminKey::PendingAdmin`, holding the proposed successor between
+  `transfer_admin` and `accept_admin`. The **active** admin is untouched and
+  still lives under each contract's own `DataKey::Admin` (escrow keeps its own
+  `PauseKey::Admin` / `PauseKey::PendingAdmin` and is unchanged). Only the
+  contracts that gain the four handover entry points — `campaign`,
+  `creator_fund`, `dispute_arbiter`, `multi_sig`, `revenue_sharing`,
+  `subscription` — ever write this key.
+- **#985 (feature-flag cap).** `shared::rollout` adds `RolloutKey::MaxFlags`,
+  an optional admin-lowered cap; absent means the code ceiling
+  `MAX_FEATURE_FLAGS = 32`. No existing `Flag`/`FlagIndex` value changes
+  meaning. Enforcement lives in `save_flag_index`, so it applies to every
+  contract that carries the rollout block.
+
+**Schema version.** `[package.metadata.stellar-aid] storage-schema` and
+`CURRENT_STORAGE_SCHEMA` should be bumped for each affected crate as part of the
+upgrade that ships these keys. The bump is **not** applied in this change: the
+`Cargo.toml` files that carry the metadata are outside the file set for these
+issues. Treat this paragraph as the migration note the bump would otherwise
+carry, and bump before deploying. No deployed contract is left *above* the new
+feature-flag cap without a note: a contract already holding more than 32 flags
+keeps them readable and toggleable, but cannot add a 33rd until it is upgraded
+and, if necessary, re-capped.
+
 ## Per-contract storage layout
 
 
@@ -1132,9 +1161,13 @@ Every site in the crate uses `env.storage().instance()` — there is not one `pe
 | `RolloutKey::Stable` | `Address` | instance | none | Stable contract id |
 | `RolloutKey::RollbackErrorBps` | `u32` | instance | none | Error rate at which automatic rollback arms |
 | `RolloutKey::Flag(Symbol)` | `bool` | instance | none | Named feature flag, one entry per flag |
-| `RolloutKey::FlagIndex` | `Vec<Symbol>` | instance | none | Enumerates flags so `disable_all_flags` can zero them on rollback |
+| `RolloutKey::FlagIndex` | `Vec<Symbol>` | instance | none | Enumerates flags so `disable_all_flags` can zero them on rollback. Capped at `rollout::flag_cap` (#985) |
+| `RolloutKey::MaxFlags` | `u32` | instance | none | Optional admin-lowered feature-flag cap (#985); absent means `MAX_FEATURE_FLAGS = 32`. Read by `rollout::flag_cap`, written by `rollout::set_flag_cap` |
+| `AdminKey::PendingAdmin` | `Address` | instance | none | Successor proposed by `admin::propose`, consumed by `admin::accept` and removed by `admin::cancel` (#983). Distinct from escrow's own `PauseKey::PendingAdmin` |
 
 `config.rs`, `correlation.rs` and `validation.rs` write no storage at all; `config.rs` performs read-only cross-contract invocations, `correlation.rs` is pure hashing plus one event publish, and `validation.rs` is length checking.
+
+The `admin` module (#983) is a fifth key enum: `AdminKey` holds only the *pending* successor, while each contract keeps its **active** admin under its own `DataKey::Admin`. Adding this key is a layout addition, not a re-interpretation of any existing key — see the storage-schema note above the per-contract tables.
 
 **TTL constants.**
 

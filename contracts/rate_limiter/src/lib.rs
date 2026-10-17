@@ -24,7 +24,7 @@
 
 #![no_std]
 
-use soroban_sdk::{contract, contractimpl, symbol_short, Address, Env, Map, Symbol};
+use soroban_sdk::{contract, contractimpl, symbol_short, Address, Env, Map, Symbol, Vec};
 
 pub mod types;
 pub mod errors;
@@ -119,7 +119,15 @@ impl RateLimiter {
         Ok(())
     }
 
-    /// Set a new rate limit configuration
+    /// Set a new rate limit configuration.
+    ///
+    /// `limit` here is a *domain* threshold — the number of actions an account
+    /// may take per window — not a page size, so it is **validated** (must be
+    /// non-zero) rather than run through `shared::pagination::clamp_limit`. A
+    /// legitimate policy may allow thousands of actions per window, and clamping
+    /// it to `MAX_LIMIT` would silently weaken the limit an admin asked for. The
+    /// bounded-read concern addressed by #984 lives in `get_limits_page`, which
+    /// does clamp its own `limit` through the shared helper.
     pub fn set_limit(
         env: Env,
         admin: Address,
@@ -162,6 +170,37 @@ impl RateLimiter {
     /// Get the current rate limit configuration for a key
     pub fn get_limit(env: Env, key: RateLimitKey) -> Option<RateLimitConfig> {
         load_config(&env, &key)
+    }
+
+    /// One page of every configured `(key, config)` pair, plus its [`PageInfo`]
+    /// (#984).
+    ///
+    /// The key set is the fixed `all_keys()` vocabulary, so this read is small
+    /// by construction, but it is routed through
+    /// `shared::pagination::collect_window` all the same: the workspace's list
+    /// readers share one shape, and the caller's `limit` is clamped there (a
+    /// zero serves the default page, anything above `MAX_LIMIT` is capped).
+    ///
+    /// [`PageInfo`]: shared::pagination::PageInfo
+    pub fn get_limits_page(
+        env: Env,
+        start: u32,
+        limit: u32,
+    ) -> (
+        Vec<(RateLimitKey, RateLimitConfig)>,
+        shared::pagination::PageInfo,
+    ) {
+        let keys = all_keys();
+        let configs: Map<RateLimitKey, RateLimitConfig> = env
+            .storage()
+            .instance()
+            .get(&types::DataKey::RateLimitConfig)
+            .unwrap_or_else(|| Map::new(&env));
+        let total = keys.len() as u32;
+        shared::pagination::collect_window(&env, total, start, limit, |i| {
+            let key = *keys.get(i as usize)?;
+            configs.get(key).map(|config| (key, config))
+        })
     }
 
     /// Check if an action is allowed for an account.
