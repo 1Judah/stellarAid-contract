@@ -459,6 +459,21 @@ impl SubscriptionContract {
             .unwrap_or_else(|| Vec::new(&env))
     }
 
+    /// Paginated variant of `get_payments`.
+    pub fn get_payments_page(
+        env: Env,
+        subscriber: Address,
+        start: u32,
+        limit: u32,
+    ) -> (Vec<PaymentRecord>, shared::PageInfo) {
+        let payments: Vec<PaymentRecord> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Payments(subscriber))
+            .unwrap_or_else(|| Vec::new(&env));
+        shared::pagination::paginated(&env, &payments, start, limit)
+    }
+
     // ── Health monitoring (#678) and gradual rollout (#684) ──────────────
     pub fn health_check(env: Env) -> shared::health::HealthReport {
         let report = shared::health::health_check(&env);

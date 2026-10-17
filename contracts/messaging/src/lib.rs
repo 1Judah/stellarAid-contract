@@ -206,7 +206,7 @@ impl MessagingContract {
             return Err(MessagingError::Unauthorized);
         }
 
-        let cap = limit.min(MAX_HISTORY);
+        let cap = shared::pagination::clamp_limit(limit).min(MAX_HISTORY);
         let mut result: Vec<Message> = Vec::new(&env);
         let end_seq = from_seq.saturating_add(cap).min(conv.message_count + 1);
         let mut seq = from_seq;
